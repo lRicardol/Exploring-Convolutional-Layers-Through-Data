@@ -1,8 +1,30 @@
+"""
+Inference script for Fashion-MNIST CNN model.
+
+This script loads a trained PyTorch model (model.pth),
+performs inference on new Fashion-MNIST samples,
+and returns predicted class labels.
+
+Designed to be compatible with local execution
+and Amazon SageMaker inference workflows.
+"""
+
+import json
 import torch
 import torch.nn as nn
-import numpy as np
+import torchvision.transforms as transforms
+from torchvision.datasets import FashionMNIST
+from torch.utils.data import DataLoader
+
+
+# Model Definition
 
 class FashionMNISTCNN(nn.Module):
+    """
+    Convolutional Neural Network designed for Fashion-MNIST.
+    Architecture must match the one used during training.
+    """
+
     def __init__(self):
         super(FashionMNISTCNN, self).__init__()
 
@@ -17,6 +39,7 @@ class FashionMNISTCNN(nn.Module):
         )
 
         self.fc_layers = nn.Sequential(
+            nn.Flatten(),
             nn.Linear(64 * 7 * 7, 128),
             nn.ReLU(),
             nn.Linear(128, 10)
@@ -24,69 +47,138 @@ class FashionMNISTCNN(nn.Module):
 
     def forward(self, x):
         x = self.conv_layers(x)
-        x = x.view(x.size(0), -1)  # flatten
         x = self.fc_layers(x)
         return x
 
 
+# Load Model
 
-def load_model(model_path="model.pth"):
+def load_model(model_path: str):
+    """
+    Loads the trained model from disk.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model = FashionMNISTCNN()
-    model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
     model.eval()
+
+    return model, device
+
+
+# Data Loader (Inference)
+
+def get_test_loader(batch_size=32):
+    """
+    Loads Fashion-MNIST test dataset for inference.
+    """
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+
+    test_dataset = FashionMNIST(
+        root="./data",
+        train=False,
+        download=True,
+        transform=transform
+    )
+
+    test_loader = DataLoader(
+        dataset=test_dataset,
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+    return test_loader
+
+
+# Inference Function
+
+def run_inference(model, device, data_loader, num_samples=10):
+    """
+    Runs inference on a batch of test images and prints predictions.
+    """
+
+    class_names = [
+        "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
+        "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"
+    ]
+
+    predictions = []
+
+    with torch.no_grad():
+        for images, labels in data_loader:
+            images = images.to(device)
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+
+            for i in range(min(num_samples, len(preds))):
+                predictions.append({
+                    "predicted_label": class_names[preds[i].item()],
+                    "true_label": class_names[labels[i].item()]
+                })
+
+            break  # Only one batch for demonstration
+
+    return predictions
+
+
+# SageMaker-compatible Functions
+
+def model_fn(model_dir):
+    """
+    Loads the model for SageMaker inference.
+    """
+    model_path = f"{model_dir}/model.pth"
+    model, device = load_model(model_path)
     return model
 
 
-
-def preprocess_input(pixel_array):
+def input_fn(request_body, content_type):
     """
-    pixel_array: array-like of shape (784,)
-    Returns tensor of shape (1, 1, 28, 28)
+    Parses input data for SageMaker endpoint.
     """
-
-    x = np.array(pixel_array, dtype=np.float32)
-
-    # Normalize [0,255] -> [0,1]
-    x = x / 255.0
-
-    # Reshape to CNN format
-    x = x.reshape(1, 1, 28, 28)
-
-    return torch.tensor(x)
+    if content_type == "application/json":
+        data = json.loads(request_body)
+        tensor = torch.tensor(data, dtype=torch.float32)
+        return tensor
+    else:
+        raise ValueError(f"Unsupported content type: {content_type}")
 
 
-
-def predict(pixel_array, model_path="model.pth"):
-    model = load_model(model_path)
-    x = preprocess_input(pixel_array)
+def predict_fn(input_data, model):
+    """
+    Performs inference using the loaded model.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    input_data = input_data.to(device)
 
     with torch.no_grad():
-        outputs = model(x)
-        prediction = torch.argmax(outputs, dim=1).item()
+        outputs = model(input_data)
+        _, predictions = torch.max(outputs, 1)
 
-    return prediction
+    return predictions.cpu().numpy()
 
 
+def output_fn(prediction, content_type):
+    """
+    Formats the prediction output.
+    """
+    if content_type == "application/json":
+        return json.dumps(prediction.tolist())
+    else:
+        raise ValueError(f"Unsupported content type: {content_type}")
 
-CLASS_NAMES = {
-    0: "T-shirt / Top",
-    1: "Trouser",
-    2: "Pullover",
-    3: "Dress",
-    4: "Coat",
-    5: "Sandal",
-    6: "Shirt",
-    7: "Sneaker",
-    8: "Bag",
-    9: "Ankle boot"
-}
 
+# Local Execution
 
 if __name__ == "__main__":
+    model, device = load_model("model.pth")
+    test_loader = get_test_loader()
+    results = run_inference(model, device, test_loader)
 
-    # Example: dummy input (replace with a row from CSV)
-    dummy_pixels = np.zeros(784)
-
-    pred_class = predict(dummy_pixels)
-    print("Predicted class ID:", pred_class)
-    print("Predicted label:", CLASS_NAMES[pred_class])
+    for r in results:
+        print(f"Predicted: {r['predicted_label']} | True: {r['true_label']}")
